@@ -93,6 +93,39 @@ def test_absurd_retry_after_is_capped():
     assert limiter.penalise(86400) == pytest.approx(300.0)
 
 
+def test_consecutive_429s_wait_longer_each_time():
+    """Retrying at exactly Retry-After and being refused again is one
+    throttling event met with too little patience, not two refusals."""
+    limiter, _ = make(LimiterConfig(retry_after_pad=0.0, jitter_seconds=0.0,
+                                    penalty_escalation=3.0,
+                                    abort_after_consecutive_429=99,
+                                    abort_after_total_429=99))
+    first = limiter.penalise(10)
+    second = limiter.penalise(10)
+    third = limiter.penalise(10)
+    assert (first, second, third) == pytest.approx((10.0, 30.0, 90.0))
+
+
+def test_escalation_resets_after_a_clean_response():
+    limiter, _ = make(LimiterConfig(retry_after_pad=0.0, jitter_seconds=0.0,
+                                    abort_after_consecutive_429=99,
+                                    abort_after_total_429=99))
+    limiter.penalise(10)
+    limiter.penalise(10)
+    limiter.note_success()
+    assert limiter.penalise(10) == pytest.approx(10.0)
+
+
+def test_escalation_is_capped():
+    limiter, _ = make(LimiterConfig(retry_after_pad=0.0, jitter_seconds=0.0,
+                                    max_penalty_seconds=120.0,
+                                    abort_after_consecutive_429=99,
+                                    abort_after_total_429=99))
+    for _ in range(8):
+        delay = limiter.penalise(60)
+    assert delay == pytest.approx(120.0)
+
+
 def test_429_permanently_slows_the_run_down():
     limiter, _ = make(LimiterConfig(max_calls=30, floor_calls=6))
     before = limiter.effective_rate

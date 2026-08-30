@@ -63,8 +63,20 @@ class LimiterConfig:
     retry_after_pad: float = 2.0
     #: Ignore an absurd Retry-After rather than sleeping for an hour.
     retry_after_cap: float = 300.0
-    #: Consecutive 429s that end the run.
-    abort_after_consecutive_429: int = 3
+    #: Each consecutive 429 waits this many times longer than the last.
+    #: Observed behaviour: Spotify's Retry-After can be shorter than the
+    #: window that actually needs to drain, so retrying at exactly
+    #: Retry-After produces another 429 immediately, and three of those in a
+    #: row end the run over what was really one throttling event.
+    penalty_escalation: float = 3.0
+    #: However far the escalation goes, never sleep longer than this.
+    max_penalty_seconds: float = 900.0
+    #: Consecutive 429s that end the run. Four rather than three because the
+    #: waits between them escalate: four attempts spread over ~90 seconds is
+    #: markedly *more* patient than the three-over-14-seconds this used to be,
+    #: and it survives a throttling window that simply needs a minute to
+    #: drain — which is what a real 1,400-book run ran into.
+    abort_after_consecutive_429: int = 4
     #: Total 429s in one run that end the run.
     abort_after_total_429: int = 8
     #: The budget is halved on each 429 but never falls below this.
@@ -195,6 +207,14 @@ class RateLimiter:
         else:
             delay = min(float(retry_after), self.config.retry_after_cap)
         delay += self.config.retry_after_pad
+
+        # Escalate on repeats. Retrying at exactly Retry-After and being
+        # refused again is not three separate refusals — it is one, met with
+        # too little patience. Waiting longer each time gives the real window
+        # a chance to drain before the run gives up on itself.
+        if self.stats.consecutive_429 > 1:
+            delay *= self.config.penalty_escalation ** (self.stats.consecutive_429 - 1)
+        delay = min(delay, self.config.max_penalty_seconds)
         delay += self.rng.uniform(0, self.config.jitter_seconds)
 
         now = self.clock()
@@ -209,8 +229,11 @@ class RateLimiter:
         if self.stats.consecutive_429 >= self.config.abort_after_consecutive_429:
             raise RateLimitAbort(
                 f"{self.stats.consecutive_429} consecutive 429 responses from "
-                "Spotify — stopping the run rather than continuing to knock. "
-                "Progress is cached; try again in a few hours at a lower rate."
+                "Spotify, over roughly a minute and a half of waiting — stopping "
+                "rather than continuing to knock.\n"
+                "Everything checked so far is cached, so a re-run only covers "
+                "what is left. Wait an hour or so, then re-run with a lower "
+                "rate, e.g. --rate 0.5."
             )
         if self.stats.hits_429 >= self.config.abort_after_total_429:
             raise RateLimitAbort(

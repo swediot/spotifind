@@ -208,7 +208,13 @@ def cmd_check(args) -> int:
     total = len(books)
     state = {"hits": 0, "last_line": 0.0}
 
-    with SpotifyClient(source, limiter, market=client_market) as client:
+    def throttled(retry_after) -> None:
+        wait = f"{int(retry_after)}s" if retry_after else "a while"
+        print(f"\n  Spotify asked us to slow down — waiting {wait}, then "
+              f"continuing more slowly.")
+
+    with SpotifyClient(source, limiter, market=client_market,
+                       on_throttle=throttled) as client:
 
         def progress(index: int, result) -> None:
             if result.match.confidence == "strong":

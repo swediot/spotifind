@@ -12,6 +12,7 @@ import random
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -141,7 +142,7 @@ def test_repeated_429s_stop_the_run_rather_than_hammering(clock):
     with make_client(mock, clock) as client:
         with pytest.raises(RateLimitAbort):
             client.search_audiobooks("Piranesi")
-    assert len(mock.requests) == 3, "must give up after three, not keep knocking"
+    assert len(mock.requests) == 4, "must give up after four, not keep knocking"
 
 
 def test_the_run_stops_on_the_first_429_storm_not_per_book(clock, tmp_path):
@@ -149,7 +150,7 @@ def test_the_run_stops_on_the_first_429_storm_not_per_book(clock, tmp_path):
     with make_client(mock, clock) as client, cache_at(tmp_path) as cache:
         summary = check_books(WANTED, client, cache, "US")
     assert summary.status == "aborted"
-    assert len(mock.requests) == 3
+    assert len(mock.requests) == 4, "the whole run stops, not one book at a time"
     assert "cached" in summary.note
 
 
@@ -325,6 +326,70 @@ def test_the_run_is_recorded(clock, tmp_path):
         row = cache.previous_runs()[0]
         assert row["status"] == "ok"
         assert row["requests"] > 0
+
+
+def test_a_run_survives_a_throttling_window_that_needs_a_minute(clock, tmp_path):
+    """The failure a real 1,400-book run hit.
+
+    Spotify refuses everything for a while and its Retry-After is shorter
+    than the window that actually needs to drain. Retrying at exactly
+    Retry-After earns another refusal, and the run used to give up on what
+    was really one throttling event. With escalating waits it should ride
+    it out instead.
+    """
+    catalogue = MockSpotify(CATALOGUE)
+    refuse_until = 60.0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if clock.now < refuse_until:
+            return httpx.Response(429, headers={"Retry-After": "5"},
+                                  json={"error": {"status": 429}})
+        return catalogue.handle(request)
+
+    limiter = RateLimiter(config=LimiterConfig(), clock=clock.time,
+                          sleep=clock.sleep, rng=random.Random(0))
+    client = SpotifyClient(static_token_source("t"), limiter,
+                           transport=httpx.MockTransport(handler),
+                           sleep=clock.sleep, rng=random.Random(0))
+    with client, cache_at(tmp_path) as cache:
+        summary = check_books(WANTED, client, cache, "US")
+
+    assert summary.status == "ok", "should have ridden out the throttling"
+    assert len(summary.strong) == 4
+    assert limiter.stats.hits_429 >= 3
+    assert clock.now >= refuse_until
+
+
+def test_a_permanent_throttle_still_stops_the_run(clock, tmp_path):
+    """Patience has a limit — an endless 429 must still end the run."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "5"},
+                              json={"error": {"status": 429}})
+
+    limiter = RateLimiter(config=LimiterConfig(), clock=clock.time,
+                          sleep=clock.sleep, rng=random.Random(0))
+    client = SpotifyClient(static_token_source("t"), limiter,
+                           transport=httpx.MockTransport(handler),
+                           sleep=clock.sleep, rng=random.Random(0))
+    with client, cache_at(tmp_path) as cache:
+        summary = check_books(WANTED, client, cache, "US")
+
+    assert summary.status == "aborted"
+    assert client.stats.requests == 4, "four attempts, then stop knocking"
+
+
+def test_the_run_is_told_when_it_is_being_throttled(clock, tmp_path):
+    """A long silent sleep should say why it is silent."""
+    notices = []
+    catalogue = MockSpotify(CATALOGUE, script=[(429, {"Retry-After": "3"})])
+    limiter = RateLimiter(config=LimiterConfig(), clock=clock.time,
+                          sleep=clock.sleep, rng=random.Random(0))
+    client = SpotifyClient(static_token_source("t"), limiter,
+                           transport=catalogue.transport, sleep=clock.sleep,
+                           on_throttle=notices.append)
+    with client:
+        client.search_audiobooks("Piranesi Susanna Clarke")
+    assert notices == [3.0]
 
 
 # -- several editions of one book -----------------------------------------

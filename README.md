@@ -141,8 +141,28 @@ returns **429** with a `Retry-After` header. So:
 - The cache exists so you can look at the results as often as you like
   without ever asking Spotify again.
 
-If you want to be even more cautious, `--rate 0.5` is a perfectly good idea
-and costs you 20 minutes once.
+### What a real run actually showed
+
+A 1,396-book run at the default 1/s: **682 requests, ~694 books, 26 minutes,
+then three 429s and a clean stop.** So one request per second is sustainable
+for about 20 minutes and then it isn't — which no documentation anywhere
+says, and which is consistent with a Development Mode app having a quota over
+a longer window than the documented 30 seconds.
+
+Two things changed as a result:
+
+- **Waits between repeated 429s now escalate** (×3 each time, capped at 15
+  minutes) instead of retrying at exactly `Retry-After`. Spotify's
+  `Retry-After` can be shorter than the window that actually needs to drain,
+  so retrying at exactly that value earns another refusal — and three of
+  those in a row used to end a run over what was really one throttling event.
+- **The abort threshold went from 3 consecutive to 4**, which is *more*
+  patient rather than less: four attempts now span about 90 seconds where
+  three used to span 14.
+
+**For a first full run, use `--rate 0.5`.** It costs about 45 minutes instead
+of 23, and is far more likely to finish in one go. The cache means a stopped
+run is never wasted work.
 
 ## What "found" means
 
@@ -248,7 +268,7 @@ last run" flag is suppressed on a first run, when everything would carry it.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 183 assertions, no network
+python -m pytest tests/ -q          # 189 assertions, no network
 python tests/bench.py 1400 1.0      # simulate a full run on a fake clock
 ```
 

@@ -83,6 +83,7 @@ class SpotifyClient:
         max_5xx_retries: int = 3,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
+        on_throttle: Callable[[float | None], None] | None = None,
     ) -> None:
         self.token_provider = token_provider
         self.limiter = limiter
@@ -90,6 +91,9 @@ class SpotifyClient:
         # ignores this; it only bites in client-credentials mode.
         self.market = market
         self.max_5xx_retries = max_5xx_retries
+        # Told about every 429, so a long silent sleep can say why it is
+        # silent instead of looking like a hang.
+        self.on_throttle = on_throttle
         self.sleep = sleep
         self.rng = rng or random.Random()
         self.stats = ClientStats()
@@ -150,6 +154,8 @@ class SpotifyClient:
             if status == 429:
                 self.stats.rate_limited += 1
                 retry_after = _retry_after(response)
+                if self.on_throttle:
+                    self.on_throttle(retry_after)
                 # Raises RateLimitAbort once Spotify has said no too often.
                 self.limiter.penalise(retry_after)
                 continue
