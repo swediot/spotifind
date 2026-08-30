@@ -132,9 +132,12 @@ returns **429** with a `Retry-After` header. So:
 - On a 429 it waits out `Retry-After` in full plus a pad, and then
   **permanently halves the rate for the rest of the run**. A 429 is treated as
   evidence that the chosen rate was wrong, not as a speed bump.
-- **Three 429s in a row, or eight in one run, and it stops.** Backing off and
-  continuing to knock is what gets an app's access pulled. Stopping is cheap
-  here because the cache means resuming later costs nothing.
+- Repeated 429s **wait three times longer each time**, because Spotify's
+  `Retry-After` can be shorter than the window that actually needs to drain.
+- **Four 429s in a row, or eight in one run, and it stops** — four attempts
+  spanning about 90 seconds. Backing off and continuing to knock is what gets
+  an app's access pulled. Stopping is cheap here because the cache means
+  resuming later costs nothing.
 - A 403 stops the run immediately rather than repeating a configuration
   error 1,400 times.
 - The User-Agent identifies the tool as a personal, single-threaded checker.
