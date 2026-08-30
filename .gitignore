@@ -1,0 +1,29 @@
+# The cache and the sign-in token — never commit either.
+*.sqlite3
+*.sqlite3-journal
+token.json
+.env
+
+# Reports contain your reading list. Yours, not the repo's.
+spotify-availability.csv
+spotify-availability.html
+*storygraph_export*.csv
+*goodreads_library_export*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

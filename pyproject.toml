@@ -1,0 +1,19 @@
+[project]
+name = "spotifind"
+version = "1.0.0"
+description = "Which books on your to-read list are on Spotify as audiobooks"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+spotifind = "spotifind.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["spotifind*"]
