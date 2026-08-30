@@ -12,7 +12,7 @@ from . import auth
 from .cache import Cache
 from .checker import FALLBACK_MODES, check_books, estimate_requests
 from .csvimport import CsvFormatError, read_books
-from .ratelimit import LimiterConfig, RateLimiter
+from .ratelimit import LimiterConfig, RateLimitAbort, RateLimiter
 from .report import write_csv, write_html
 from . import saver
 from .spotify import Forbidden, SpotifyClient, SpotifyError
@@ -101,7 +101,13 @@ def cmd_probe(args) -> int:
     source = _token_source(args)
     limiter = _limiter(args)
     market = args.market if args.auth == "app" else None
-    with SpotifyClient(source, limiter, market=market) as client:
+
+    def throttled(retry_after) -> None:
+        header = f"Retry-After: {int(retry_after)}s" if retry_after else "no Retry-After header"
+        print(f"Spotify asked us to slow down (429, {header}).", flush=True)
+
+    with SpotifyClient(source, limiter, market=market,
+                       on_throttle=throttled) as client:
         query = args.query
         try:
             candidates = client.search_audiobooks(query)
@@ -209,9 +215,10 @@ def cmd_check(args) -> int:
     state = {"hits": 0, "last_line": 0.0}
 
     def throttled(retry_after) -> None:
-        wait = f"{int(retry_after)}s" if retry_after else "a while"
-        print(f"\n  Spotify asked us to slow down — waiting {wait}, then "
-              f"continuing more slowly.")
+        header = (f"Retry-After: {int(retry_after)}s" if retry_after
+                  else "no Retry-After header")
+        print(f"\n  Spotify asked us to slow down (429, {header}) — backing off.",
+              flush=True)
 
     with SpotifyClient(source, limiter, market=client_market,
                        on_throttle=throttled) as client:
@@ -479,6 +486,9 @@ def main(argv: list[str] | None = None) -> int:
     except auth.AuthError as exc:
         print(f"\n{exc}", file=sys.stderr)
         return 2
+    except RateLimitAbort as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 3
     except KeyboardInterrupt:
         print("\nStopped. Everything checked so far is cached.", file=sys.stderr)
         return 130

@@ -88,9 +88,15 @@ def test_429_without_a_header_waits_a_whole_window():
     assert limiter.penalise(None) == pytest.approx(32.0)
 
 
-def test_absurd_retry_after_is_capped():
-    limiter, _ = make(LimiterConfig(retry_after_cap=300.0, retry_after_pad=0.0, jitter_seconds=0.0))
-    assert limiter.penalise(86400) == pytest.approx(300.0)
+def test_absurd_retry_after_aborts_immediately():
+    """A Retry-After measured in hours is a daily quota, not a throttle.
+    Observed live: 429 with Retry-After: 72017 (~20 hours). Sleeping the cap
+    and knocking again earns nothing but more refusals."""
+    limiter, clock = make(LimiterConfig(retry_after_cap=300.0, retry_after_pad=0.0, jitter_seconds=0.0))
+    with pytest.raises(RateLimitAbort) as excinfo:
+        limiter.penalise(72017)
+    assert "hours" in str(excinfo.value)
+    assert clock.total_slept == 0.0
 
 
 def test_consecutive_429s_wait_longer_each_time():

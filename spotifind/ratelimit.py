@@ -61,7 +61,10 @@ class LimiterConfig:
     min_gap_seconds: float = 0.9
     #: Extra seconds added to any Retry-After we are handed.
     retry_after_pad: float = 2.0
-    #: Ignore an absurd Retry-After rather than sleeping for an hour.
+    #: A Retry-After beyond this is treated as "come back tomorrow", not a
+    #: throttle: the run aborts at once instead of sleeping and re-knocking.
+    #: Observed in the wild: a Development Mode app answering 429 with
+    #: Retry-After: 72017 — twenty hours.
     retry_after_cap: float = 300.0
     #: Each consecutive 429 waits this many times longer than the last.
     #: Observed behaviour: Spotify's Retry-After can be shorter than the
@@ -200,12 +203,25 @@ class RateLimiter:
             self._current_max = new_max
             self.stats.budget_reductions += 1
 
+        if retry_after is not None and retry_after > self.config.retry_after_cap:
+            # A Retry-After measured in hours is not a throttle, it is a
+            # closed door — a Development Mode app that has spent its quota
+            # for the day. Sleeping the cap and knocking again earns nothing
+            # but more refusals, so stop now and say when to come back.
+            hours = float(retry_after) / 3600.0
+            raise RateLimitAbort(
+                f"Spotify says come back in {int(retry_after)}s (~{hours:.1f} "
+                "hours). That is a daily quota, not a momentary throttle — "
+                "retrying sooner only earns more refusals. Everything checked "
+                "so far is cached; re-run after the wait."
+            )
+
         if retry_after is None or retry_after < 0:
             # No header: fall back to a full window, which is the longest
             # period Spotify's own accounting can be looking at.
             delay = self.config.window_seconds
         else:
-            delay = min(float(retry_after), self.config.retry_after_cap)
+            delay = float(retry_after)
         delay += self.config.retry_after_pad
 
         # Escalate on repeats. Retrying at exactly Retry-After and being
