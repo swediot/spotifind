@@ -4,12 +4,10 @@
 token.json
 .env
 
-# Reports contain your reading list. Yours, not the repo's —
-# except the snapshot in results/, which is published on purpose.
+# Reports contain your reading list. Yours, not the repo's.
 spotify-availability.csv
 spotify-availability.html
-!results/spotify-availability.csv
-!results/spotify-availability.html
+results/
 *storygraph_export*.csv
 *goodreads_library_export*.csv
 
