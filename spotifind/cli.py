@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from . import auth
+from .budget import DEFAULT_DAILY_BUDGET, DailyBudget
 from .cache import Cache
 from .checker import FALLBACK_MODES, check_books, estimate_requests
 from .csvimport import CsvFormatError, read_books
@@ -39,6 +40,11 @@ DEFAULT_CACHE = Path(
 
 def _client_id(args) -> str:
     value = args.client_id or os.environ.get("SPOTIFY_CLIENT_ID", "")
+    if not value and getattr(args, "auth", "user") == "user":
+        # `spotifind login` records the client id alongside the refresh
+        # token, so a user who has signed in once need not dig it out of the
+        # developer dashboard for every run.
+        value = auth.stored_client_id(Path(args.token_path))
     if not value:
         sys.exit(
             "No Spotify client id. Create an app at "
@@ -59,6 +65,21 @@ def _token_source(args):
 
 def _limiter(args) -> RateLimiter:
     return RateLimiter(config=LimiterConfig.from_rate(args.rate))
+
+
+def _budget(args, cache: Cache) -> DailyBudget | None:
+    """The daily request budget, kept in the cache database. None if turned off."""
+    if args.daily_budget < 0:
+        sys.exit("--daily-budget cannot be negative (0 turns it off).")
+    if args.daily_budget == 0:
+        return None
+    return DailyBudget(cache, limit=args.daily_budget)
+
+
+def _days(requests: int, left_today: int, per_day: int) -> int:
+    """Days to send `requests`, with `left_today` available now and `per_day` after."""
+    rest = max(0, requests - left_today)
+    return 1 + -(-rest // per_day)
 
 
 def _fmt_seconds(seconds: float) -> str:
@@ -106,17 +127,20 @@ def cmd_probe(args) -> int:
         header = f"Retry-After: {int(retry_after)}s" if retry_after else "no Retry-After header"
         print(f"Spotify asked us to slow down (429, {header}).", flush=True)
 
-    with SpotifyClient(source, limiter, market=market,
-                       on_throttle=throttled) as client:
-        query = args.query
-        try:
-            candidates = client.search_audiobooks(query)
-        except Forbidden as exc:
-            print(f"403 from Spotify.\n{exc}")
-            return 2
-        except SpotifyError as exc:
-            print(f"Failed: {exc}")
-            return 2
+    with Cache(args.cache) as cache:
+        budget = _budget(args, cache)
+        with SpotifyClient(source, limiter, market=market, on_throttle=throttled,
+                           budget=budget) as client:
+            query = args.query
+            try:
+                candidates = client.search_audiobooks(query)
+            except Forbidden as exc:
+                print(f"403 from Spotify.\n{exc}")
+                return 2
+            except SpotifyError as exc:
+                print(f"Failed: {exc}")
+                return 2
+        budget_line = budget.status_line() if budget else ""
 
     print(f"Query: {query!r}   auth: {args.auth}   market: {market or 'from your account'}")
     if not candidates:
@@ -145,6 +169,8 @@ def cmd_probe(args) -> int:
             f"\nThis market returns editions in {', '.join(sorted(languages))}. "
             "`check` prefers\nthe --prefer-language edition (default en) and notes the others."
         )
+    if budget_line:
+        print("\n" + budget_line)
     return 0
 
 
@@ -200,6 +226,28 @@ def cmd_check(args) -> int:
             f"\n{low}" + (f"–{high}" if high != low else "") + f" requests at {args.rate:g}/s "
             f"≈ {span}. {len(books) - low} answers come from the cache."
         )
+    budget = _budget(args, cache)
+    if budget is not None and low:
+        left = budget.remaining()
+        if budget.refuses_now():
+            print(budget.status_line())
+            cache.close()
+            if args.dry_run:
+                return 0
+            print("Nothing sent to Spotify. Re-run after that time; cached books are skipped.")
+            return 3
+        if left == 0:
+            print("The daily budget is coming back one request at a time right now, as "
+                  "yesterday's requests turn 24 hours old; this run will keep to that pace.")
+        else:
+            print(budget.status_line())
+        if left and high > left:
+            print(
+                f"This run can send {left} of them, then it stops by itself and the "
+                "rest waits for the budget to free up."
+                + (f" At {budget.limit} a day, the whole list needs about "
+                   f"{_days(low, left, budget.limit)} days." if low > left else "")
+            )
     if args.dry_run:
         cache.close()
         return 0
@@ -221,7 +269,7 @@ def cmd_check(args) -> int:
               flush=True)
 
     with SpotifyClient(source, limiter, market=client_market,
-                       on_throttle=throttled) as client:
+                       on_throttle=throttled, budget=budget) as client:
 
         def progress(index: int, result) -> None:
             if result.match.confidence == "strong":
@@ -230,9 +278,10 @@ def cmd_check(args) -> int:
             if now - state["last_line"] < 0.5 and index != total:
                 return
             state["last_line"] = now
+            left = f" · {budget.remaining()} left today" if budget is not None else ""
             sys.stdout.write(
                 f"\r  {index}/{total} checked · {state['hits']} on Spotify · "
-                f"{client.stats.requests} requests · {limiter.effective_rate:.2f}/s   "
+                f"{client.stats.requests} requests{left} · {limiter.effective_rate:.2f}/s   "
             )
             sys.stdout.flush()
 
@@ -265,6 +314,7 @@ def cmd_check(args) -> int:
         f"\n  worth a look    {len(summary.likely) + len(summary.unconfirmed)}"
         f"\n  not found       {len(summary.missing)}"
         + (f"\n  errors          {len(summary.failed)}" if summary.failed else "")
+        + (f"\n  not checked yet {summary.unchecked}" if summary.unchecked else "")
         + (f"\n  new since last  {len(summary.newly_found)}" if summary.newly_found else "")
     )
     print(f"\n  {requests_made} requests, {summary.from_cache} from cache, {_fmt_seconds(elapsed)}.")
@@ -309,7 +359,7 @@ def cmd_save(args) -> int:
 
         source = auth.user_token_source(_client_id(args), Path(args.token_path),
                                         required_scopes=auth.SAVE_SCOPES)
-        with SpotifyClient(source, _limiter(args)) as client:
+        with SpotifyClient(source, _limiter(args), budget=_budget(args, cache)) as client:
             summary = saver.undo(client, cache, chunk_size=args.chunk)
         cache.close()
         print(f"\nRemoved {summary.saved_count} of {len(pending)}.")
@@ -361,7 +411,7 @@ def cmd_save(args) -> int:
                                     required_scopes=auth.SAVE_SCOPES)
     total = len(items)
 
-    with SpotifyClient(source, _limiter(args)) as client:
+    with SpotifyClient(source, _limiter(args), budget=_budget(args, cache)) as client:
         def progress(done: int, _total: int) -> None:
             sys.stdout.write(f"\r  {done}/{total} processed…   ")
             sys.stdout.flush()
@@ -411,9 +461,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="user: your account and its market (default). app: client credentials, "
                             "lets you name a market you are not in.")
         p.add_argument("--token-path", default=str(auth.DEFAULT_TOKEN_PATH))
-        p.add_argument("--rate", type=float, default=1.0,
-                       help="requests per second (default 1.0; be kind)")
+        p.add_argument("--rate", type=float, default=0.5,
+                       help="requests per second (default 0.5, one every two seconds; be kind)")
         p.add_argument("--market", default="", help="ISO country code; only honoured with --auth app")
+        p.add_argument("--cache", default=str(DEFAULT_CACHE))
+        p.add_argument("--daily-budget", type=int, default=DEFAULT_DAILY_BUDGET, metavar="N",
+                       help=f"most requests to send in any 24 hours (default {DEFAULT_DAILY_BUDGET}; "
+                            "Spotify cut this kind of app off at about 700). 0 turns it off.")
 
     p_login = sub.add_parser("login", help="sign in once with your Spotify account")
     common(p_login)
@@ -438,7 +492,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_check.add_argument("csv", help="path to the export")
     p_check.add_argument("--out-csv", default="")
     p_check.add_argument("--out-html", default="")
-    p_check.add_argument("--cache", default=str(DEFAULT_CACHE))
     p_check.add_argument("--refresh", action="store_true", help="ignore cached answers")
     p_check.add_argument("--limit", type=int, default=0, help="only check the first N books")
     p_check.add_argument("--all-shelves", action="store_true",
@@ -459,7 +512,6 @@ def build_parser() -> argparse.ArgumentParser:
     common(p_save)
     p_save.add_argument("report", nargs="?", default="spotify-availability.csv",
                         help="the CSV written by `check` (default: ./spotify-availability.csv)")
-    p_save.add_argument("--cache", default=str(DEFAULT_CACHE))
     p_save.add_argument("--include-probably", action="store_true",
                         help="also save 'probably' rows, not just confirmed ones")
     p_save.add_argument("--include-check", action="store_true",

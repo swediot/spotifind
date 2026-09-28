@@ -58,12 +58,12 @@ def test_minimum_gap_is_respected():
     assert min(gaps) >= 1.0
 
 
-def test_default_config_is_about_one_per_second():
+def test_default_config_is_about_one_every_two_seconds():
     limiter, clock = make()
     for _ in range(120):
         limiter.acquire()
-    # 120 calls should take roughly two minutes, not two seconds.
-    assert clock.now == pytest.approx(120, abs=15)
+    # 120 calls should take roughly four minutes, not two seconds.
+    assert clock.now == pytest.approx(240, abs=20)
 
 
 def test_from_rate_builds_a_consistent_config():

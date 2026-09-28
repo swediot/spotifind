@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
+from .budget import BudgetExhausted
 from .cache import Cache
 from .csvimport import Book
 from .matching import Candidate, Match, best_match
@@ -40,6 +41,11 @@ class RunSummary:
     searched: int = 0
     from_cache: int = 0
     errors: int = 0
+    #: Books left unchecked because the run stopped before reaching them and
+    #: the cache had no fresh answer. They are not in ``results``.
+    unchecked: int = 0
+    #: True when the stop was the daily budget, not a refusal from Spotify.
+    stopped_by_budget: bool = False
 
     @property
     def strong(self) -> list[BookResult]:
@@ -103,6 +109,11 @@ def check_books(
     # true and useless — it would flag the whole report. Only a run that has
     # something to compare against can report changes.
     first_run = cache.count_for_market(market) == 0
+    # Once the run has stopped asking Spotify, it still walks the rest of the
+    # list so the report includes every book the cache already knows about.
+    # A budget stop is routine, and a report that silently dropped hundreds of
+    # answered books would make every partial day look worse than it is.
+    stopped = False
 
     for index, book in enumerate(books, start=1):
         if not refresh:
@@ -115,19 +126,28 @@ def check_books(
                     on_progress(index, result)
                 continue
 
+        if stopped:
+            summary.unchecked += 1
+            continue
+
         try:
             result = _lookup(book, client, cache, market, fallback=fallback,
                              first_run=first_run, prefer_language=prefer_language)
         except RateLimitAbort as exc:
             summary.status = "aborted"
             summary.note = str(exc)
-            break
+            summary.stopped_by_budget = isinstance(exc, BudgetExhausted)
+            summary.unchecked += 1
+            stopped = True
+            continue
         except Forbidden as exc:
             # This is never a one-book problem; stop rather than repeat it
             # 1,400 times.
             summary.status = "failed"
             summary.note = str(exc)
-            break
+            summary.unchecked += 1
+            stopped = True
+            continue
         except SpotifyError as exc:
             result = BookResult(book=book, match=Match(None, "none", 0.0, False), error=str(exc))
             summary.errors += 1

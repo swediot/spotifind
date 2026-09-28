@@ -6,6 +6,7 @@ import random
 import sys
 from pathlib import Path
 
+import json
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -55,6 +56,7 @@ def wired(monkeypatch):
         return SpotifyClient(
             static_token_source("t"), limiter, market=market,
             transport=mock.transport, sleep=clock.sleep, rng=random.Random(0),
+            budget=kwargs.get("budget"),
         )
 
     monkeypatch.setattr(cli, "SpotifyClient", fake_client)
@@ -84,7 +86,7 @@ def test_dry_run_asks_spotify_nothing(wired, export, tmp_path, capsys):
     code = run(["check", str(export), "--client-id", "x", "--dry-run"], tmp_path)
     out = capsys.readouterr().out
     assert code == 0
-    assert "requests at 1/s" in out
+    assert "requests at 0.5/s" in out
     assert wired.requests == []
 
 
@@ -143,8 +145,19 @@ def test_a_missing_file_is_a_clean_error(wired, tmp_path):
 def test_no_client_id_anywhere_is_a_clean_error(export, tmp_path, monkeypatch):
     monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
     with pytest.raises(SystemExit) as exc:
-        run(["check", str(export)], tmp_path)
+        run(["check", str(export), "--token-path", str(tmp_path / "no-token.json")], tmp_path)
     assert "developer.spotify.com" in str(exc.value)
+
+
+def test_client_id_falls_back_to_the_one_saved_at_login(wired, export, tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
+    token_path = tmp_path / "token.json"
+    token_path.write_text(json.dumps({"client_id": "saved-id", "refresh_token": "r"}))
+    code = run(["check", str(export), "--token-path", str(token_path),
+                "--out-csv", str(tmp_path / "r.csv"),
+                "--out-html", str(tmp_path / "r.html")], tmp_path)
+    assert code == 0
+    assert (tmp_path / "r.csv").exists()
 
 
 def test_probe_reports_a_visible_catalogue(wired, tmp_path, capsys):
@@ -161,7 +174,8 @@ def _probe_against(monkeypatch, mock):
     def fake_client(source, limiter, *, market=None, **kwargs):
         limiter.clock, limiter.sleep = clock.time, clock.sleep
         return SpotifyClient(static_token_source("t"), limiter, market=market,
-                             transport=mock.transport, sleep=clock.sleep)
+                             transport=mock.transport, sleep=clock.sleep,
+                             budget=kwargs.get("budget"))
 
     monkeypatch.setattr(cli, "SpotifyClient", fake_client)
     monkeypatch.setattr(cli, "_token_source", lambda args: static_token_source("t"))

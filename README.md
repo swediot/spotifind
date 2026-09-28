@@ -97,8 +97,9 @@ export. Useful flags:
 | Flag | Why |
 | --- | --- |
 | `--dry-run` | print the request count and time estimate, ask Spotify nothing |
-| `--rate 0.5` | halve the request rate (default 1/second) |
+| `--rate 0.25` | halve the request rate (default 0.5/second, one request every two seconds) |
 | `--limit 50` | try it on the first 50 books before committing to the whole list |
+| `--daily-budget 400` | send at most this many requests in any 24 hours (default 600; see below) |
 | `--refresh` | ignore cached answers |
 | `--fallback never` | one request per book instead of up to two (see below) |
 | `--prefer-language de` | report the German edition when a book has several |
@@ -109,9 +110,15 @@ Expect, for a 1,400-book list at the default rate:
 
 | | requests | time |
 | --- | --- | --- |
-| cold, `--fallback never` | 1,400 | ~23 min |
-| cold, `--fallback empty` (default) | up to 2,800 | ~47 min |
+| cold, `--fallback never` | 1,400 | ~47 min |
+| cold, `--fallback empty` (default) | up to 2,800 | ~93 min |
 | warm (nothing stale) | 0 | instant |
+
+A cold list that size needs more requests than one day's budget, so it takes
+several days: about three with `--fallback never`, up to five with the
+default. Each run stops by itself at the budget and says when to come back;
+the next run picks up where it stopped. `--dry-run` says how many days to
+expect.
 
 Stopping it with Ctrl-C is safe. Everything already checked is cached, and
 re-running skips it.
@@ -122,20 +129,33 @@ This was the explicit brief, so it drove the design.
 
 Spotify does not publish a rate limit. What it documents is the *shape*:
 calls are counted in a **rolling 30-second window**, and crossing the line
-returns **429** with a `Retry-After` header. So:
+returns **429** with a `Retry-After` header. That is not the limit that bites,
+though: in practice a Development Mode app is cut off after about **700
+requests a day**, whatever the rate (see below). So:
 
+- **A daily request budget, 600 by default.** Every request is written down
+  in the cache database, and before sending another the tool counts how many
+  went out in the last 24 hours. At the budget the run stops by itself, before
+  Spotify has to refuse anything, and says when the budget frees up. The
+  window rolls: yesterday's requests free up one at a time as they turn 24
+  hours old, and a run started while that is happening follows their pace
+  instead of stopping. The budget covers `check`, `probe` and `save` alike.
+- **A refusal measured in hours is remembered.** A `Retry-After` longer than
+  five minutes is kept in the cache database, and until it has passed the tool
+  will not contact Spotify at all — not even for `probe`.
 - The limiter models that exact window and sits well under any plausible
-  line — **1 request/second by default**, with a minimum gap between calls so
-  a burst can never form even after a long idle pause.
+  line — **one request every two seconds by default**, with a minimum gap
+  between calls so a burst can never form even after a long idle pause.
 - **One request at a time.** There is no concurrency anywhere in the project,
   and a test asserts it.
-- On a 429 it waits out `Retry-After` in full plus a pad, and then
-  **permanently halves the rate for the rest of the run**. A 429 is treated as
+- On a 429 it waits out `Retry-After` in full plus a five-second pad, and
+  then **permanently halves the rate for the rest of the run**, down to a floor
+  of one request every ten seconds. A 429 is treated as
   evidence that the chosen rate was wrong, not as a speed bump.
 - Repeated 429s **wait three times longer each time**, because Spotify's
   `Retry-After` can be shorter than the window that actually needs to drain.
 - **Four 429s in a row, or eight in one run, and it stops** — four attempts
-  spanning about 90 seconds. Backing off and continuing to knock is what gets
+  spanning a couple of minutes. Backing off and continuing to knock is what gets
   an app's access pulled. Stopping is cheap here because the cache means
   resuming later costs nothing.
 - A 403 stops the run immediately rather than repeating a configuration
@@ -146,13 +166,13 @@ returns **429** with a `Retry-After` header. So:
 
 ### What a real run actually showed
 
-A 1,396-book run at the default 1/s: **682 requests, ~694 books, 26 minutes,
+A 1,396-book run at what was then the default 1/s: **682 requests, ~694 books, 26 minutes,
 then three 429s and a clean stop.** So one request per second is sustainable
 for about 20 minutes and then it isn't — which no documentation anywhere
 says, and which is consistent with a Development Mode app having a quota over
 a longer window than the documented 30 seconds.
 
-Two things changed as a result:
+Three things changed as a result:
 
 - **Waits between repeated 429s now escalate** (×3 each time, capped at 15
   minutes) instead of retrying at exactly `Retry-After`. Spotify's
@@ -160,12 +180,33 @@ Two things changed as a result:
   so retrying at exactly that value earns another refusal — and three of
   those in a row used to end a run over what was really one throttling event.
 - **The abort threshold went from 3 consecutive to 4**, which is *more*
-  patient rather than less: four attempts now span about 90 seconds where
+  patient rather than less: four attempts now span a couple of minutes where
   three used to span 14.
+- **The default rate is now 0.5/s**, one request every two seconds, and the
+  floor it halves down to after a 429 is one request every ten seconds. A
+  full cold run takes about twice as long and is far more likely to finish in
+  one go. The cache means a stopped run is never wasted work.
 
-**For a first full run, use `--rate 0.5`.** It costs about 45 minutes instead
-of 23, and is far more likely to finish in one go. The cache means a stopped
-run is never wasted work.
+A second real run, on 26 September 2026 at the new 0.5/s, **was cut off after
+697 requests** — fifteen more than the first, at half the speed — with a
+`Retry-After` of 83,818 seconds, about 23 hours. Going slower bought nothing.
+The limit is a count of about 700 requests a day, and the `Retry-After`
+ended almost exactly 24 hours after that run's first request, which is what a
+rolling 24-hour window would do. So:
+
+- **The daily budget above now stops each run at 600 requests** in any 24
+  hours, comfortably short of the cutoff. Lower it with `--daily-budget` if
+  a run is ever refused anyway; `--daily-budget 0` turns it off, for an app
+  with extended quota.
+- **Upgrading counts what already happened.** A cache database from before
+  the budget has no record of individual requests, so on first open the
+  ledger is seeded from the run history — each run's requests spread evenly
+  over its start and finish. The first run after upgrading therefore knows
+  the day's quota is already spent.
+- **A stopped run still reports every cached book.** It used to leave out
+  everything after the point where it stopped, cached or not; now the report
+  includes every book the cache has an answer for and counts the rest as
+  "not checked yet".
 
 ## What "found" means
 
@@ -267,12 +308,17 @@ catalogue grows, so "not there" is the answer worth re-asking. Run it monthly
 and the report tells you what turned up since last time; the "new since the
 last run" flag is suppressed on a first run, when everything would carry it.
 
+The same database holds the daily budget's ledger: the time of every request
+sent in the last week, and any long refusal from Spotify. Point two commands
+at different `--cache` files and they keep separate budgets, so don't, unless
+they use different Spotify apps.
+
 ## Tests
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 189 assertions, no network
-python tests/bench.py 1400 1.0      # simulate a full run on a fake clock
+python -m pytest tests/ -q          # 217 tests, no network
+python tests/bench.py 1400 0.5      # simulate a full run on a fake clock
 ```
 
 **Nothing here has ever spoken to the real api.spotify.com** — the sandbox
@@ -290,8 +336,11 @@ The first real run is therefore the first real test. Do it with `--limit 20`.
   catalogue at all. Spotify has restricted some catalogue endpoints for apps
   without extended quota, and I could not verify audiobook search specifically.
   If `--auth app` returns 403 or empty where `--auth user` works, that's why.
-- Spotify's actual rate limit number. Unpublished. 1/second is a guess made
-  from the shape of the documented window, on the cautious side.
+- Spotify's actual limits. Unpublished. Two real runs were cut off at 682
+  and 697 requests, which puts the daily quota near 700, but whether it
+  varies by day, by app or by endpoint is unknown, and so is whether the
+  window is truly rolling. The budget of 600 and the rolling window are the
+  cautious reading of two data points.
 - Whether the `languages` field is reliably populated on audiobook objects.
   The code treats a missing value as "unknown" rather than "wrong", so the
   worst case is a less useful report, not a wrong one — but if it turns out

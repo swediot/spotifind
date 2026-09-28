@@ -4,6 +4,8 @@ Small because this tool needs exactly one endpoint: ``GET /v1/search`` with
 ``type=audiobook``. Polite because the brief was "do not get me banned":
 
 * every call goes through the :class:`~spotifind.ratelimit.RateLimiter`,
+* every call is counted against the :class:`~spotifind.budget.DailyBudget`,
+  because the limit that actually bites is a daily count, not a rate,
 * one request at a time, never concurrent,
 * 429 is not retried blindly — the limiter slows the whole run down and stops
   it if Spotify keeps saying no,
@@ -30,18 +32,21 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 import httpx
 
 from .matching import Candidate
 from .ratelimit import RateLimitAbort, RateLimiter
 
+if TYPE_CHECKING:
+    from .budget import DailyBudget
+
 API_BASE = "https://api.spotify.com/v1"
 
 USER_AGENT = (
     "spotifind/1.0 (personal to-read list checker; single-threaded; "
-    "1 req/s; +https://github.com/)"
+    "0.5 req/s, 600 req/day; +https://github.com/)"
 )
 
 # Search's maximum page size since the February 2026 API changes.
@@ -84,9 +89,13 @@ class SpotifyClient:
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
         on_throttle: Callable[[float | None], None] | None = None,
+        budget: "DailyBudget | None" = None,
     ) -> None:
         self.token_provider = token_provider
         self.limiter = limiter
+        # Counts every request across runs and refuses once a day's worth has
+        # gone out. None only in tests and in code that never talks to Spotify.
+        self.budget = budget
         # With a user token Spotify uses the account's own country and
         # ignores this; it only bites in client-credentials mode.
         self.market = market
@@ -123,6 +132,10 @@ class SpotifyClient:
         refreshed = False
         while True:
             self.limiter.acquire()
+            if self.budget is not None:
+                # Raises BudgetExhausted rather than send a request the day's
+                # quota has no room for. Retries count too: Spotify does.
+                self.budget.spend()
             self.stats.requests += 1
             token = self.token_provider()
             try:
@@ -156,6 +169,10 @@ class SpotifyClient:
                 retry_after = _retry_after(response)
                 if self.on_throttle:
                     self.on_throttle(retry_after)
+                if self.budget is not None:
+                    # A Retry-After of hours has to outlive this run, or the
+                    # next one knocks on the same closed door.
+                    self.budget.note_retry_after(retry_after)
                 # Raises RateLimitAbort once Spotify has said no too often.
                 self.limiter.penalise(retry_after)
                 continue

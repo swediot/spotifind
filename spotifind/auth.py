@@ -367,6 +367,12 @@ def refresh_user_token(client_id: str, refresh_token: str, token_path: Path = DE
     )
 
 
+def stored_client_id(token_path: Path = DEFAULT_TOKEN_PATH) -> str:
+    """The client id recorded by ``spotifind login``, or "" if there is none."""
+    stored = _load(token_path)
+    return str((stored or {}).get("client_id") or "")
+
+
 def load_user_token(
     client_id: str,
     token_path: Path = DEFAULT_TOKEN_PATH,

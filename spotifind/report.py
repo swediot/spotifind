@@ -150,8 +150,12 @@ def write_html(summary: RunSummary, path: str | Path, *, meta: dict | None = Non
     )
     banner = ""
     if summary.status == "aborted":
-        banner = ('<div class="banner">This run stopped early because Spotify asked it to slow '
-                  'down. Everything checked so far is here and cached — re-running picks up where '
+        why = ("it reached its daily request budget, before Spotify had to refuse anything"
+               if summary.stopped_by_budget else "Spotify asked it to slow down")
+        left = (f" {summary.unchecked} books are not checked yet and are not listed here."
+                if summary.unchecked else "")
+        banner = (f'<div class="banner">This run stopped early because {why}.{left} '
+                  'Everything checked so far is here and cached — re-running picks up where '
                   'it left off.</div>')
     elif summary.status == "failed":
         banner = f'<div class="banner">This run stopped: {html.escape(summary.note[:300])}</div>'

@@ -78,7 +78,7 @@ def run(n: int, rate: float, hit_fraction: float = 0.15) -> None:
 
 if __name__ == "__main__":
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 1400
-    rate = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    rate = float(sys.argv[2]) if len(sys.argv) > 2 else 0.5
     print(f"\n{count} books at {rate:g} requests/second\n")
     run(count, rate)
     print()

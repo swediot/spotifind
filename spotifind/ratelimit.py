@@ -6,7 +6,8 @@ second window", and a 429 carrying a ``Retry-After`` header when you cross it.
 
 So this module models exactly that shape and then sits well under it:
 
-* a rolling 30-second window with a hard cap (default 30 calls, i.e. 1/s),
+* a rolling 30-second window with a hard cap (default 15 calls, i.e. one
+  request every two seconds),
 * a minimum gap between consecutive calls, so a burst can never form,
 * strictly one request in flight at a time (there is no concurrency anywhere
   in this project, on purpose),
@@ -54,13 +55,15 @@ class RateLimitAbort(RuntimeError):
 @dataclass
 class LimiterConfig:
     #: Hard cap on calls inside the rolling window.
-    max_calls: int = 30
+    max_calls: int = 15
     #: Length of the rolling window, in seconds. Matches Spotify's own.
     window_seconds: float = 30.0
     #: Never fire two calls closer together than this.
-    min_gap_seconds: float = 0.9
-    #: Extra seconds added to any Retry-After we are handed.
-    retry_after_pad: float = 2.0
+    min_gap_seconds: float = 1.8
+    #: Extra seconds added to any Retry-After we are handed. Generous on
+    #: purpose: Spotify's Retry-After has been seen to under-report how long
+    #: the window actually needs to drain.
+    retry_after_pad: float = 5.0
     #: A Retry-After beyond this is treated as "come back tomorrow", not a
     #: throttle: the run aborts at once instead of sleeping and re-knocking.
     #: Observed in the wild: a Development Mode app answering 429 with
@@ -83,7 +86,8 @@ class LimiterConfig:
     #: Total 429s in one run that end the run.
     abort_after_total_429: int = 8
     #: The budget is halved on each 429 but never falls below this.
-    floor_calls: int = 6
+    #: Three calls per 30-second window is one every ten seconds.
+    floor_calls: int = 3
     #: Random jitter added to every wait, so repeated runs do not align.
     jitter_seconds: float = 0.15
 
@@ -105,7 +109,7 @@ class LimiterConfig:
         window = float(kwargs.pop("window_seconds", 30.0))
         max_calls = max(1, int(calls_per_second * window))
         gap = kwargs.pop("min_gap_seconds", max(0.0, (1.0 / calls_per_second) * 0.9))
-        floor = kwargs.pop("floor_calls", max(1, min(6, max_calls)))
+        floor = kwargs.pop("floor_calls", max(1, min(3, max_calls)))
         return cls(
             max_calls=max_calls,
             window_seconds=window,
@@ -245,11 +249,11 @@ class RateLimiter:
         if self.stats.consecutive_429 >= self.config.abort_after_consecutive_429:
             raise RateLimitAbort(
                 f"{self.stats.consecutive_429} consecutive 429 responses from "
-                "Spotify, over roughly a minute and a half of waiting — stopping "
+                "Spotify, over a couple of minutes of waiting — stopping "
                 "rather than continuing to knock.\n"
                 "Everything checked so far is cached, so a re-run only covers "
                 "what is left. Wait an hour or so, then re-run with a lower "
-                "rate, e.g. --rate 0.5."
+                "rate, e.g. --rate 0.25."
             )
         if self.stats.hits_429 >= self.config.abort_after_total_429:
             raise RateLimitAbort(

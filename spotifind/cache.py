@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -74,7 +75,22 @@ CREATE TABLE IF NOT EXISTS runs (
     status      TEXT NOT NULL DEFAULT 'running',
     note        TEXT NOT NULL DEFAULT ''
 );
+
+-- Every request sent to Spotify, for the daily budget (see budget.py).
+-- Unix time, because it is compared across runs and days.
+CREATE TABLE IF NOT EXISTS api_requests (
+    at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS api_requests_at ON api_requests (at);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
 """
+
+# Requests older than this are no use to any budget; they are pruned on open.
+LEDGER_KEEP_SECONDS = 7 * 24 * 3600
 
 
 def _now() -> str:
@@ -102,9 +118,50 @@ class Cache:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        had_ledger = self._has_table("api_requests")
         self.conn.executescript(SCHEMA)
         self._migrate()
+        if not had_ledger:
+            self._backfill_ledger()
+        self.conn.execute("DELETE FROM api_requests WHERE at < ?",
+                          (time.time() - LEDGER_KEEP_SECONDS,))
         self.conn.commit()
+
+    def _has_table(self, name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        return row is not None
+
+    def _backfill_ledger(self) -> None:
+        """Seed a brand-new request ledger from the runs table.
+
+        A database from before the daily budget knows how many requests each
+        run made and when it started and finished, but not when each request
+        went out. Spreading each run's requests evenly over its span is close
+        enough for a 24-hour budget — and without it, the first run after an
+        upgrade would believe the budget is untouched on a day Spotify has
+        already shut the door.
+        """
+        rows = self.conn.execute(
+            "SELECT started_at, finished_at, requests FROM runs "
+            "WHERE requests > 0 AND finished_at != ''"
+        ).fetchall()
+        cutoff = time.time() - LEDGER_KEEP_SECONDS
+        stamps: list[tuple[float]] = []
+        for row in rows:
+            try:
+                start = _epoch(row["started_at"])
+                end = _epoch(row["finished_at"])
+            except ValueError:
+                continue
+            if end < cutoff:
+                continue
+            n = int(row["requests"])
+            step = (end - start) / n if n > 1 and end > start else 0.0
+            stamps.extend((start + i * step,) for i in range(n))
+        if stamps:
+            self.conn.executemany("INSERT INTO api_requests (at) VALUES (?)", stamps)
 
     def _migrate(self) -> None:
         """Add columns a database made by an earlier version is missing.
@@ -290,6 +347,42 @@ class Cache:
             "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
         )) as cur:
             return cur.fetchall()
+
+    # -- the request ledger (budget.RequestLedger) --------------------------
+
+    def record_request(self, at: float) -> None:
+        self.conn.execute("INSERT INTO api_requests (at) VALUES (?)", (float(at),))
+        self.conn.commit()
+
+    def request_times_since(self, since: float) -> list[float]:
+        rows = self.conn.execute(
+            "SELECT at FROM api_requests WHERE at > ? ORDER BY at", (float(since),)
+        )
+        return [float(row["at"]) for row in rows]
+
+    def blocked_until(self) -> float:
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = 'blocked_until'"
+        ).fetchone()
+        try:
+            return float(row["value"]) if row else 0.0
+        except ValueError:
+            return 0.0
+
+    def set_blocked_until(self, at: float) -> None:
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('blocked_until', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (repr(float(at)),),
+        )
+        self.conn.commit()
+
+
+def _epoch(stamp: str) -> float:
+    moment = datetime.fromisoformat(stamp)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
 
 
 def _get(row: sqlite3.Row, name: str):
