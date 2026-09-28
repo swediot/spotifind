@@ -260,7 +260,9 @@ class SpotifyClient:
             return
         if len(uris) > MAX_LIBRARY_URIS:
             raise ValueError(f"at most {MAX_LIBRARY_URIS} uris per call")
-        self._request("PUT", "/me/library", json_body={"uris": list(uris)})
+        # Query parameter, not body: a JSON body gets 400 "Missing required
+        # field: uris" from the real API.
+        self._request("PUT", "/me/library", params={"uris": ",".join(uris)})
         self.stats.saved += len(uris)
 
     def library_remove(self, uris: Sequence[str]) -> None:
@@ -269,7 +271,7 @@ class SpotifyClient:
             return
         if len(uris) > MAX_LIBRARY_URIS:
             raise ValueError(f"at most {MAX_LIBRARY_URIS} uris per call")
-        self._request("DELETE", "/me/library", json_body={"uris": list(uris)})
+        self._request("DELETE", "/me/library", params={"uris": ",".join(uris)})
         self.stats.removed += len(uris)
 
 

@@ -6,7 +6,6 @@ save twice, and always be able to take it back out.
 
 from __future__ import annotations
 
-import json
 import random
 import sys
 from pathlib import Path
@@ -75,8 +74,11 @@ class LibraryMock:
             return httpx.Response(200, json=[u in self.already for u in uris])
 
         if path.endswith("/me/library"):
-            body = json.loads(request.content.decode() or "{}")
-            uris = body.get("uris", [])
+            # Like the real API: uris in the query string, a body is ignored.
+            uris = [u for u in request.url.params.get("uris", "").split(",") if u]
+            if not uris:
+                return httpx.Response(400, json={"error": {
+                    "status": 400, "message": "Missing required field: uris"}})
             if request.method == "PUT":
                 self.save_calls += 1
                 self.saved.extend(uris)
